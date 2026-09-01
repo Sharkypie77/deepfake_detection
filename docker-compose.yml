@@ -1,0 +1,141 @@
+version: '3.8'
+
+services:
+  # Redis Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: deepfake_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - deepfake_network
+
+  # PostgreSQL Database (Production alternative to SQLite)
+  postgres:
+    image: postgres:15-alpine
+    container_name: deepfake_postgres
+    environment:
+      POSTGRES_USER: deepfake
+      POSTGRES_PASSWORD: deepfake_secure_password_123
+      POSTGRES_DB: deepfake_detection
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deepfake"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - deepfake_network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepfake_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - DATABASE_URL=postgresql://deepfake:deepfake_secure_password_123@postgres:5432/deepfake_detection
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - DEVICE=cpu  # Change to 'cuda' if GPU available
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./models:/app/models
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - deepfake_network
+    restart: unless-stopped
+
+  # Celery Worker 1
+  celery_worker_1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepfake_celery_worker_1
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - DATABASE_URL=postgresql://deepfake:deepfake_secure_password_123@postgres:5432/deepfake_detection
+      - DEVICE=cuda  # Set to 'cpu' if no GPU
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./models:/app/models
+    command: celery -A celery_tasks worker --loglevel=info --concurrency=2 -n worker1@%h
+    networks:
+      - deepfake_network
+    restart: unless-stopped
+
+  # Celery Worker 2
+  celery_worker_2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepfake_celery_worker_2
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - DATABASE_URL=postgresql://deepfake:deepfake_secure_password_123@postgres:5432/deepfake_detection
+      - DEVICE=cuda
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./models:/app/models
+    command: celery -A celery_tasks worker --loglevel=info --concurrency=2 -n worker2@%h
+    networks:
+      - deepfake_network
+    restart: unless-stopped
+
+  # Celery Flower (Task Monitoring)
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepfake_flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - redis
+    command: celery -A celery_tasks flower --port=5555
+    networks:
+      - deepfake_network
+    restart: unless-stopped
+
+networks:
+  deepfake_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  postgres_data:

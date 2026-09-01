@@ -21,10 +21,6 @@ torchaudio==2.1.2
 openai-whisper==20231117
 wave==0.0.2
 
-# Audio Anti-Spoofing (AASIST)
-# Note: Install pretrained weights via: python download_aasist.py
-# Community pretrained AASIST available from HuggingFace
-
 # FastAPI & Backend
 fastapi==0.104.1
 uvicorn==0.24.0
@@ -32,7 +28,7 @@ python-multipart==0.0.6
 pydantic==2.5.0
 python-dotenv==1.0.0
 
-# Async Task Queue
+# Async Task Queue (Celery + Redis)
 celery==5.3.4
 redis==5.0.1
 
@@ -40,9 +36,11 @@ redis==5.0.1
 sqlalchemy==2.0.23
 sqlite3  # built-in
 
+# Telegram Bot
+python-telegram-bot==20.3
+
 # API Clients
 requests==2.31.0
-twilio==8.10.0  # For WhatsApp Cloud API
 
 # Data Processing
 numpy==1.24.3
@@ -69,3 +67,4 @@ mypy==1.7.0
 # Utilities
 pillow==10.1.0
 pyyaml==6.0.1
+

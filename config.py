@@ -38,12 +38,10 @@ API_VERSION = "1.0.0"
 API_DESCRIPTION = "Language-agnostic multimodal deepfake detection for Indian languages & global content"
 
 # ============================================================================
-# WHATSAPP BOT CONFIGURATION (Placeholder)
+# TELEGRAM BOT CONFIGURATION
 # ============================================================================
-WHATSAPP_BUSINESS_ACCOUNT_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "YOUR_BUSINESS_ACCOUNT_ID")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "YOUR_PHONE_NUMBER_ID")
-WHATSAPP_API_TOKEN = os.getenv("WHATSAPP_API_TOKEN", "YOUR_ACCESS_TOKEN")
-WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN", "deepfake_verify_token_123")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+# Get token from @BotFather on Telegram: https://t.me/botfather
 
 # ============================================================================
 # REDIS & CELERY CONFIGURATION

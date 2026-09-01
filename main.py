@@ -21,6 +21,28 @@ from config import (
 )
 from models import Video, VisionAnalysis, AudioAnalysis, SyncAnalysis, FinalResult, AuditLog, init_db
 from pipeline import DeepfakeDetectionPipeline
+from pydantic import BaseModel
+from typing import List
+
+
+# ============================================================================
+# REQUEST MODELS (Pydantic)
+# ============================================================================
+
+class BatchSubmitRequest(BaseModel):
+    job_name: str
+    video_ids: List[str]
+    priority: str = "normal"  # low, normal, high
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "job_name": "election_batch_phase_1",
+                "video_ids": ["vid_001", "vid_002", "vid_003"],
+                "priority": "high"
+            }
+        }
+
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -413,6 +435,106 @@ def save_results_to_db(session, video_id: str, result: dict):
     session.add(final_result)
     
     session.commit()
+
+
+# ============================================================================
+# BATCH PROCESSING (Phase 6)
+# ============================================================================
+
+@app.post("/api/v1/batch/submit")
+async def submit_batch_job(
+    request: BatchSubmitRequest
+):
+    """
+    Submit multiple videos for batch processing (Phase 6)
+    
+    Queues videos to Celery worker pool for parallel analysis
+    
+    Request body:
+    {
+        "job_name": "election_videos_batch_1",
+        "video_ids": ["vid1", "vid2", "vid3"],
+        "priority": "high"
+    }
+    
+    Returns:
+    {
+        "batch_id": "batch_uuid",
+        "total_videos": 3,
+        "status": "queued",
+        "task_ids": ["task1", "task2", "task3"]
+    }
+    """
+    
+    from celery_tasks import batch_analyze_videos
+    
+    batch_id = str(uuid.uuid4())
+    
+    # Queue batch job
+    task = batch_analyze_videos.apply_async(
+        args=(batch_id, request.video_ids),
+        task_id=batch_id,
+        queue='default'
+    )
+    
+    logger.info(f"📦 Batch {batch_id} submitted: {len(request.video_ids)} videos")
+    
+    return {
+        "batch_id": batch_id,
+        "total_videos": len(request.video_ids),
+        "status": "queued",
+        "task_ids": request.video_ids,
+        "message": f"Batch submitted to queue. Check status with /api/v1/batch/{batch_id}/status"
+    }
+
+
+@app.get("/api/v1/batch/{batch_id}/status")
+async def get_batch_status(batch_id: str):
+    """
+    Get status of a batch job (Phase 6)
+    
+    Returns:
+    {
+        "batch_id": "batch_uuid",
+        "total": 10,
+        "completed": 7,
+        "failed": 1,
+        "processing": 2,
+        "progress": 80,
+        "status": "processing"
+    }
+    """
+    
+    from celery_tasks import check_batch_status
+    
+    result = check_batch_status.apply_async(args=(batch_id,)).get()
+    
+    return result
+
+
+@app.get("/api/v1/batch/{batch_id}/results")
+async def get_batch_results(batch_id: str):
+    """
+    Get consolidated results for a batch (Phase 6)
+    
+    Returns summary statistics:
+    {
+        "batch_id": "batch_uuid",
+        "total_analyzed": 10,
+        "deepfakes": 3,
+        "authentic": 5,
+        "inconclusive": 2,
+        "deepfake_percentage": 30.0,
+        "average_risk_score": 42.5,
+        "flagged_for_review": [...]
+    }
+    """
+    
+    from celery_tasks import get_batch_results
+    
+    result = get_batch_results.apply_async(args=(batch_id,)).get()
+    
+    return result
 
 
 # ============================================================================
