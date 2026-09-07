@@ -85,26 +85,26 @@ class IndianDeepfakeDataset(Dataset):
         video_path, label, category = self.samples[idx]
         
         try:
-            # Extract audio frame
-            import librosa
-            audio, sr = librosa.load(video_path, sr=16000, duration=10)
-            
-            # Compute mel-spectrogram
-            mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=128)
-            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-            
-            # Normalize
-            mel_spec_db = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-6)
-            
-            # Convert to tensor
-            mel_tensor = torch.from_numpy(mel_spec_db).float().unsqueeze(0)  # Add channel dim
-            
-            return mel_tensor, label, category
+            from PIL import Image
+            from facenet_pytorch import MTCNN
+            cap = cv2.VideoCapture(video_path)
+            frame_count = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok:
+                raise ValueError("could not decode a video frame")
+            detector = MTCNN(image_size=224, margin=20, keep_all=False, device="cpu")
+            face = detector(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+            if face is None:
+                face = torch.from_numpy(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).float() / 255
+                face = torch.nn.functional.interpolate(face.unsqueeze(0), (224, 224)).squeeze(0)
+            return face, label, category
         
         except Exception as e:
             logger.warning(f"Error loading {video_path}: {e}")
             # Return dummy data on error
-            return torch.zeros((1, 128, 626)), label, category
+            return torch.zeros((3, 224, 224)), label, category
 
 
 class DeepfakeDetectorFineTune(pl.LightningModule):
@@ -119,7 +119,7 @@ class DeepfakeDetectorFineTune(pl.LightningModule):
         
         # Pretrained backbone
         import timm
-        self.backbone = timm.create_model('efficientnet_v2_s', pretrained=True)
+        self.backbone = timm.create_model('efficientnetv2_rw_s', pretrained=True, num_classes=num_classes)
         
         # Replace final layer
         in_features = self.backbone.classifier.in_features
@@ -129,8 +129,6 @@ class DeepfakeDetectorFineTune(pl.LightningModule):
         self.criterion = nn.CrossEntropyLoss()
         
         # Metrics
-        self.train_accuracy = pl.metrics.Accuracy()
-        self.val_accuracy = pl.metrics.Accuracy()
     
     def forward(self, x):
         return self.backbone(x)
@@ -140,9 +138,8 @@ class DeepfakeDetectorFineTune(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         
-        self.train_accuracy(logits, y)
         self.log('train_loss', loss, prog_bar=True)
-        self.log('train_accuracy', self.train_accuracy, prog_bar=True)
+        self.log('train_accuracy', (logits.argmax(1) == y).float().mean(), prog_bar=True)
         
         return loss
     
@@ -151,9 +148,8 @@ class DeepfakeDetectorFineTune(pl.LightningModule):
         logits = self(x)
         loss = self.criterion(logits, y)
         
-        self.val_accuracy(logits, y)
         self.log('val_loss', loss, prog_bar=True)
-        self.log('val_accuracy', self.val_accuracy, prog_bar=True)
+        self.log('val_accuracy', (logits.argmax(1) == y).float().mean(), prog_bar=True)
     
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate)
@@ -195,8 +191,8 @@ class FineTuningPipeline:
         val_dataset = IndianDeepfakeDataset(str(self.data_dir), split="val")
         
         # Create dataloaders
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=0)
         
         # Model
         model = DeepfakeDetectorFineTune(learning_rate=learning_rate)
@@ -204,9 +200,9 @@ class FineTuningPipeline:
         # Trainer
         trainer = pl.Trainer(
             max_epochs=epochs,
-            gpus=1 if torch.cuda.is_available() else 0,
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=1,
             log_every_n_steps=10,
-            checkpoint_callback=True,
             default_root_dir=str(self.output_dir)
         )
         
@@ -214,11 +210,11 @@ class FineTuningPipeline:
         trainer.fit(model, train_loader, val_loader)
         
         logger.info(f"✓ Fine-tuning complete")
-        logger.info(f"✓ Best model saved to {trainer.checkpoint_callback.best_model_path}")
+        logger.info("Fine-tuning complete; inspect Lightning checkpoints in %s", self.output_dir)
         
         return {
             "status": "completed",
-            "best_model": trainer.checkpoint_callback.best_model_path,
+            "best_model": str(self.output_dir),
             "epochs": epochs,
             "batch_size": batch_size,
             "learning_rate": learning_rate
@@ -313,7 +309,7 @@ Ready for production deployment
   1. Deploy to production servers
   2. Monitor performance on live data
   3. Retrain quarterly with new datasets
-  4. Integrate with WhatsApp/Telegram bots
+  4. Integrate with the Telegram bot
 
 """
         return report

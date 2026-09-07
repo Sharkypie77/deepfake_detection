@@ -6,12 +6,16 @@ Supports all languages via pretrained models
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 import librosa
 import logging
 from pathlib import Path
 from typing import Dict, Tuple
 import whisper
+from config import AASIST_CHECKPOINT_PATH
+from checkpoint_provenance import checkpoint_status
+from modules.aasist import AASIST
 
 logger = logging.getLogger(__name__)
 
@@ -88,43 +92,31 @@ class AAISSTModule:
         self.sr = 16000
         logger.info(f"AASIST Module initialized on {device}")
         
-        # AASIST weights URL (community pretrained)
-        # For production, download and cache these
-        self.model = None  # Will be loaded on demand
-    
+        self.model = self.load_aasist_model()
+
     def load_aasist_model(self):
-        """Load pretrained AASIST model"""
-        if self.model is not None:
-            return
-        
-        try:
-            # Using pretrained weights from huggingface
-            import torch.nn as nn
-            
-            # Simple AASIST-like model for spoofing detection
-            # In production, use actual AASIST from https://github.com/clovaai/aasist
-            class SimpleAAIST(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.conv1 = nn.Conv2d(1, 32, kernel_size=5, padding=2)
-                    self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
-                    self.fc = nn.Linear(64 * 16 * 16, 2)  # Binary: real/fake
-                
-                def forward(self, x):
-                    x = torch.relu(self.conv1(x))
-                    x = torch.max_pool2d(x, 2)
-                    x = torch.relu(self.conv2(x))
-                    x = torch.max_pool2d(x, 2)
-                    x = x.view(x.size(0), -1)
-                    x = self.fc(x)
-                    return torch.softmax(x, dim=1)
-            
-            self.model = SimpleAAIST().to(self.device)
-            self.model.eval()
-            logger.info("AASIST model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load AASIST: {e}")
-            self.model = None
+        """Load and validate a real AASIST checkpoint."""
+        if not AASIST_CHECKPOINT_PATH:
+            raise RuntimeError("AASIST_CHECKPOINT_PATH is required; no audio fallback is permitted")
+        checkpoint_path = Path(AASIST_CHECKPOINT_PATH).expanduser()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"AASIST checkpoint not found: {checkpoint_path}")
+        model = AASIST().to(self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        self.checkpoint_status = checkpoint_status("aasist", str(checkpoint_path), checkpoint)
+        if not self.checkpoint_status["validated"]:
+            logger.warning("AASIST checkpoint is unvalidated: %s", self.checkpoint_status["reason"])
+        state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        state_dict = {key.removeprefix("model."): value for key, value in state_dict.items()}
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Invalid AASIST checkpoint {checkpoint_path}; missing={missing}, unexpected={unexpected}"
+            )
+        model.eval()
+        logger.info("AASIST checkpoint loaded from %s (provenance=%s)",
+                    checkpoint_path, self.checkpoint_status["validated"])
+        return model
     
     def detect_spoofing(self, audio: np.ndarray) -> Dict:
         """
@@ -134,36 +126,22 @@ class AAISSTModule:
             Dict with spoofing probability and confidence
         """
         # Extract mel-spectrogram
-        mel_spec = AudioExtractor.compute_mel_spectrogram(audio, self.sr)
-        
-        # Normalize
-        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-6)
-        
-        # Convert to tensor
-        mel_spec_tensor = torch.from_numpy(mel_spec[np.newaxis, np.newaxis, :, :]).float()
-        mel_spec_tensor = mel_spec_tensor.to(self.device)
-        
-        # Load model if needed
-        self.load_aasist_model()
-        
-        if self.model is None:
-            # Fallback: use statistical features
-            return self._fallback_spoofing_detection(audio)
-        
-        # Inference
+        samples = torch.from_numpy(np.asarray(audio, dtype=np.float32))
+        aasist_samples = 64600
+        samples = samples[:aasist_samples]
+        if samples.numel() < aasist_samples:
+            samples = F.pad(samples, (0, aasist_samples - samples.numel()))
+        samples = samples.unsqueeze(0).to(self.device)
         with torch.no_grad():
-            try:
-                output = self.model(mel_spec_tensor)
-                fake_prob = float(output[0, 1].cpu().numpy())  # Probability of fake
-                confidence = float(output[0].max().cpu().numpy())
-            except:
-                # Model size mismatch, use fallback
-                return self._fallback_spoofing_detection(audio)
+            output = self.model(samples)
+            probabilities = torch.softmax(output, dim=1)
+            fake_prob = float(probabilities[0, 1].cpu())
+            confidence = float(probabilities[0].max().cpu())
         
         return {
             "aasist_spoofing_score": fake_prob,
             "aasist_confidence": confidence,
-            "method": "neural"
+            "method": "aasist"
         }
     
     @staticmethod

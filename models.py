@@ -3,13 +3,26 @@ SQLite Database Schema for Deepfake Detection Suite
 Audit-trail enabled, structured for multimodal analysis
 """
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey, Table
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, Boolean, JSON, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from datetime import datetime
 import json
 
 Base = declarative_base()
+
+class BatchVideoMembership(Base):
+    __tablename__ = "batch_video_membership"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    batch_id = Column(String(36), ForeignKey("batch_jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    video_id = Column(String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    added_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    status = Column(String(50), default="pending", nullable=False)
+
+    batch = relationship("BatchJob", back_populates="memberships")
+    video = relationship("Video", back_populates="batch_memberships")
+    __table_args__ = (Index("ix_batch_video_membership_batch_video", "batch_id", "video_id"),)
 
 # ============================================================================
 # VIDEO METADATA TABLE
@@ -46,6 +59,7 @@ class Video(Base):
     sync_result = relationship("SyncAnalysis", back_populates="video", uselist=False)
     final_result = relationship("FinalResult", back_populates="video", uselist=False)
     audit_logs = relationship("AuditLog", back_populates="video")
+    batch_memberships = relationship("BatchVideoMembership", back_populates="video", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Video(id={self.id}, filename={self.filename}, status={self.status})>"
@@ -207,6 +221,7 @@ class FinalResult(Base):
     # Summary & Key Findings
     summary = Column(Text, nullable=True)
     key_findings = Column(JSON, nullable=True)  # List of top anomalies
+    disclaimer = Column(Text, nullable=True)
     
     # Temporal Heatmap (for dashboard visualization)
     frame_anomaly_timeline = Column(JSON, nullable=True)  # Frame-by-frame risk
@@ -265,6 +280,7 @@ class BatchJob(Base):
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
+    memberships = relationship("BatchVideoMembership", back_populates="batch", cascade="all, delete-orphan")
 
 
 # ============================================================================

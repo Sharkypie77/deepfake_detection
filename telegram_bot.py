@@ -17,10 +17,12 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ChatAction
 
-from config import TELEGRAM_BOT_TOKEN, RESULTS_DIR, VIDEO_UPLOAD_DIR
+from config import TELEGRAM_BOT_TOKEN, RESULTS_DIR, VIDEO_UPLOAD_DIR, DATABASE_URL
 from pipeline import DeepfakeDetectionPipeline
-from models import Video, FinalResult, SessionLocal, AuditLog
+from models import Video, FinalResult, AuditLog, init_db
 import uuid
+
+_, SessionLocal = init_db(DATABASE_URL)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,29 @@ class TelegramBotHandler:
             logger.info("Get your token from @BotFather on Telegram")
         
         logger.info("Telegram bot handler initialized")
+
+    async def _retry(self, operation, attempts: int = 4):
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_error = exc
+                if attempt == attempts - 1:
+                    break
+                await asyncio.sleep(2 ** attempt)
+        raise RuntimeError(f"Telegram operation failed after {attempts} attempts") from last_error
+
+    async def _edit_or_send(self, bot, chat_id: int, message_id: int, text: str):
+        try:
+            await self._retry(
+                lambda: bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id, text=text, parse_mode="Markdown"
+                )
+            )
+        except Exception:
+            logger.exception("Could not edit Telegram progress message; sending a replacement")
+            await self._retry(lambda: bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown"))
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
@@ -62,7 +87,7 @@ Welcome! I can analyze videos to detect deepfakes with 99+ language support.
 ✅ Detects voice cloning (audio)
 ✅ Detects lip-sync mismatches (sync)
 ✅ Supports Indian languages (Hindi, Tamil, Telugu, etc.)
-✅ WhatsApp/Telegram compression ready
+✅ Telegram upload support
 ✅ Fast analysis (1-5 minutes per video)
 
 **Verdict Levels:**
@@ -90,7 +115,7 @@ Select an option below:
                 text="📹 **Send me a video to analyze**\n\n"
                      "Supported formats: MP4, AVI, MOV, MKV, WebM\n"
                      "Max size: 500 MB\n"
-                     "Compression: Works with WhatsApp/Telegram quality",
+                     "Compression: Works with Telegram-compressed videos",
                 parse_mode="Markdown"
             )
             return AWAITING_VIDEO
@@ -175,9 +200,9 @@ Based on:
         await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
         
         try:
-            file = await context.bot.get_file(file_obj.file_id)
+            file = await self._retry(lambda: context.bot.get_file(file_obj.file_id))
             video_path = VIDEO_UPLOAD_DIR / filename
-            await file.download_to_drive(video_path)
+            await self._retry(lambda: file.download_to_drive(video_path))
             
             # Generate video ID
             video_id = str(uuid.uuid4())
@@ -263,11 +288,8 @@ Based on:
                 video.error_message = result["error"]
                 session.commit()
                 
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=f"❌ **Analysis Failed**\n\n{result['error']}",
-                    parse_mode="Markdown"
+                await self._edit_or_send(
+                    bot, chat_id, msg_id, f"❌ **Analysis Failed**\n\n{result['error']}"
                 )
                 return
             
@@ -359,32 +381,40 @@ Based on:
             response_text += f"\n\n{final_result.get('summary', '')[:500]}..."
             
             # Update message
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
-                text=response_text,
-                parse_mode="Markdown"
-            )
+            await self._edit_or_send(bot, chat_id, msg_id, response_text)
             
             logger.info(f"Analysis complete for {video_id}")
         
         except Exception as e:
             logger.error(f"Error processing video: {e}", exc_info=True)
             try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=f"❌ Processing error: {str(e)[:100]}",
-                    parse_mode="Markdown"
+                await self._edit_or_send(
+                    bot, chat_id, msg_id, f"❌ Processing error: {str(e)[:100]}"
                 )
-            except:
-                pass
-        
+            except Exception:
+                logger.exception("Could not send Telegram processing error")
         finally:
             if 'session' in locals():
                 session.close()
 
-
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Report the current status for a video ID passed as /status <id>."""
+        if not context.args:
+            await update.message.reply_text("Usage: /status <video_id>")
+            return
+        video_id = context.args[0]
+        session = SessionLocal()
+        try:
+            video = session.query(Video).filter(Video.id == video_id).first()
+            if not video:
+                await update.message.reply_text("Video not found.")
+                return
+            message = f"Video `{video_id[:8]}`: **{video.status}** ({video.progress_percent or 0}%)"
+            if video.error_message:
+                message += f"\nError: {video.error_message[:300]}"
+            await update.message.reply_text(message, parse_mode="Markdown")
+        finally:
+            session.close()
 async def main():
     """Start Telegram bot"""
     
@@ -411,6 +441,7 @@ async def main():
     
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("start", handler.start_command))
+    application.add_handler(CommandHandler("status", handler.status_command))
     application.add_handler(MessageHandler(filters.Regex("^(Help|About)$"), handler.button_callback))
     
     # Polling

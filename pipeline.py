@@ -5,6 +5,7 @@ Coordinates all modules (vision, audio, sync, fusion)
 
 import logging
 import uuid
+import torch
 from pathlib import Path
 from typing import Dict
 from datetime import datetime
@@ -27,14 +28,25 @@ class DeepfakeDetectionPipeline:
         """Initialize all detection modules"""
         logger.info("Initializing Deepfake Detection Pipeline...")
         
-        self.device = device
-        self.vision_module = VisionAIModule(device=device)
-        self.audio_module = AudioAnalysisModule(device=device)
+        self.device = "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
+        if device == "cuda" and self.device == "cpu":
+            logger.warning("CUDA is unavailable; falling back to CPU")
+        self.vision_module = VisionAIModule(device=self.device)
+        self.audio_module = AudioAnalysisModule(device=self.device)
         self.sync_module = SyncAnalysisModule()
         self.fusion_module = MultimodalFusionModule(
             vision_weight=0.35,
             audio_weight=0.35,
             sync_weight=0.30
+        )
+        self.pipeline_ready = True
+        self.checkpoints = {
+            "aasist": self.audio_module.aasist.checkpoint_status,
+            "vision": self.vision_module.checkpoint_status,
+        }
+        self.models_validated = all(item["validated"] for item in self.checkpoints.values())
+        self.readiness_warning = None if self.models_validated else (
+            "This verdict was produced using unvalidated model weights and should not be treated as production-grade."
         )
         
         logger.info("✅ All modules loaded successfully")
@@ -111,6 +123,7 @@ class DeepfakeDetectionPipeline:
                 
                 # Final result
                 "final_result": fusion_result,
+                "disclaimer": self.readiness_warning,
                 
                 # Summary
                 "summary": {
