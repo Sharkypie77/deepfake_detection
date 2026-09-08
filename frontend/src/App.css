@@ -1,0 +1,20 @@
+:root {
+  color: #212529;
+  background: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgba(0, 123, 255, 0.35);
+  outline-offset: 2px;
+}
+
+@media (max-width: 768px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr !important;
+  }
+}

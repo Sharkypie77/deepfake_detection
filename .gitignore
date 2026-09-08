@@ -1,0 +1,15 @@
+frontend/node_modules/
+frontend/build/
+__pycache__/
+modules/__pycache__/
+*.pyc
+data/uploads/*
+data/results/*
+data/models/*
+data/raw/asvspoof2019/
+data/raw/faceforensics/
+data/training/
+logs/*
+
+*.db
+deepfake_detection.db

@@ -18,6 +18,7 @@ VIDEO_UPLOAD_DIR = DATA_DIR / "uploads"
 MODEL_WEIGHTS_DIR = DATA_DIR / "models"
 RESULTS_DIR = DATA_DIR / "results"
 LOGS_DIR = BASE_DIR / "logs"
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
 
 # Create directories
 for directory in [VIDEO_UPLOAD_DIR, MODEL_WEIGHTS_DIR, RESULTS_DIR, LOGS_DIR]:
@@ -27,6 +28,8 @@ for directory in [VIDEO_UPLOAD_DIR, MODEL_WEIGHTS_DIR, RESULTS_DIR, LOGS_DIR]:
 # DATABASE CONFIGURATION
 # ============================================================================
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'deepfake_detection.db'}")
+AASIST_CHECKPOINT_PATH = os.getenv("AASIST_CHECKPOINT_PATH", "")
+VISION_CHECKPOINT_PATH = os.getenv("VISION_CHECKPOINT_PATH", "")
 
 # ============================================================================
 # API CONFIGURATION
@@ -42,6 +45,7 @@ API_DESCRIPTION = "Language-agnostic multimodal deepfake detection for Indian la
 # ============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 # Get token from @BotFather on Telegram: https://t.me/botfather
+
 
 # ============================================================================
 # REDIS & CELERY CONFIGURATION
@@ -61,7 +65,7 @@ class ModelConfig:
     FACE_DETECTOR_CONFIDENCE = 0.9
     
     # Vision Module - Spatial Domain
-    VISION_BACKBONE = "efficientnet_v2_s"  # EfficientNetV2-S for speed/accuracy balance
+    VISION_BACKBONE = "efficientnetv2_rw_s"  # EfficientNetV2-S with available pretrained weights
     VISION_INPUT_SIZE = (224, 224)
     VISION_MODEL_WEIGHTS = "imagenet"  # Pretrained on ImageNet
     
@@ -133,7 +137,7 @@ class ProcessingConfig:
     TASK_TIMEOUT = 600  # 10 minutes per video
     
     # GPU/CPU
-    DEVICE = "cuda"  # Will auto-fallback to cpu if not available
+    DEVICE = os.getenv("DEVICE", "cuda")  # Will auto-fallback to cpu if not available
     HALF_PRECISION = True  # Use FP16 for faster inference
 
 # ============================================================================
@@ -153,11 +157,11 @@ class SecurityConfig:
     RATE_LIMIT_REQUESTS = 100
     RATE_LIMIT_WINDOW = 3600  # 1 hour
     ENABLE_CORS = True
-    CORS_ORIGINS = ["*"]  # Update for production
+    CORS_ORIGINS = [
+        origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+        if origin.strip()
+    ]
     
-    # WhatsApp security
-    WHATSAPP_WEBHOOK_TIMEOUT = 5
-
 # ============================================================================
 # EXPORT CONFIGURATION
 # ============================================================================

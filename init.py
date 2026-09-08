@@ -107,7 +107,6 @@ def main():
             logger.info("="*60)
             logger.info("\n📝 Next steps:")
             logger.info("  1. Edit .env with your configuration")
-            logger.info("  2. For WhatsApp: Add WHATSAPP_API_TOKEN")
             logger.info("  3. Start API: uvicorn main:app --reload")
             logger.info("  4. Or test locally: python pipeline.py path/to/video.mp4\n")
             return 0

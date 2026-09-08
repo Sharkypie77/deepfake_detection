@@ -45,11 +45,12 @@ function VerdictBadge({ verdict, risk }) {
 }
 
 function ScoreMeter({ label, score, icon }) {
+  const normalizedScore = Math.max(0, Math.min(1, Number(score) || 0));
   return (
     <div style={{ marginBottom: '15px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px' }}>
         <span>{icon} {label}</span>
-        <span style={{ fontWeight: 'bold' }}>{(score * 100).toFixed(0)}%</span>
+        <span style={{ fontWeight: 'bold' }}>{(normalizedScore * 100).toFixed(0)}%</span>
       </div>
       <div style={{
         width: '100%',
@@ -59,9 +60,9 @@ function ScoreMeter({ label, score, icon }) {
         overflow: 'hidden'
       }}>
         <div style={{
-          width: `${score * 100}%`,
+          width: `${normalizedScore * 100}%`,
           height: '100%',
-          backgroundColor: score > 0.66 ? '#dc3545' : score > 0.31 ? '#ffc107' : '#28a745',
+          backgroundColor: normalizedScore > 0.66 ? '#dc3545' : normalizedScore > 0.31 ? '#ffc107' : '#28a745',
           transition: 'width 0.3s ease'
         }} />
       </div>
@@ -110,22 +111,33 @@ function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [notice, setNotice] = useState(null);
   const fileInputRef = useRef(null);
+
+  const showNotice = (message, type = 'error') => {
+    setNotice({ message, type });
+  };
 
   const handleFileSelect = (e) => {
     const file = e.target.files?.[0];
     if (file) {
       if (file.size > 500 * 1024 * 1024) {
-        alert('File too large (max 500 MB)');
+        showNotice('File too large (max 500 MB)');
         return;
       }
+      const allowed = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.webm'];
+      if (!allowed.includes(file.name.slice(file.name.lastIndexOf('.')).toLowerCase())) {
+        showNotice('Unsupported video format. Use MP4, AVI, MOV, MKV, FLV, or WEBM.');
+        return;
+      }
+      setNotice(null);
       setVideoFile(file);
     }
   };
 
   const handleUpload = async () => {
     if (!videoFile) {
-      alert('Please select a video');
+      showNotice('Please select a video first');
       return;
     }
 
@@ -147,7 +159,7 @@ function App() {
         pollResults(response.data.video_id);
       }
     } catch (error) {
-      alert(`Error: ${error.response?.data?.detail || error.message}`);
+      showNotice(`Upload failed: ${error.response?.data?.detail || error.message}`);
     } finally {
       setUploading(false);
     }
@@ -166,13 +178,22 @@ function App() {
           const resultRes = await axios.get(`${API_BASE}/api/v1/results/${id}`);
           setResult(resultRes.data);
           setLoading(false);
+        } else if (statusRes.data.status === 'failed') {
+          clearInterval(interval);
+          setLoading(false);
+          showNotice(`Analysis failed: ${statusRes.data.error || 'Unknown error'}`);
         }
       } catch (error) {
-        console.error('Poll error:', error);
+        clearInterval(interval);
+        setLoading(false);
+        showNotice(`Could not retrieve analysis status: ${error.message}`);
       }
     }, 2000);
 
-    setTimeout(() => clearInterval(interval), 10 * 60 * 1000);
+    setTimeout(() => {
+      clearInterval(interval);
+      setLoading(false);
+    }, 10 * 60 * 1000);
   };
 
   const downloadJSON = () => {
@@ -188,12 +209,34 @@ function App() {
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '20px', fontFamily: 'Segoe UI, sans-serif' }}>
+      {notice && (
+        <div
+          role="alert"
+          style={{
+            padding: '12px 16px',
+            marginBottom: '20px',
+            borderRadius: '4px',
+            backgroundColor: notice.type === 'error' ? '#f8d7da' : '#d1e7dd',
+            color: notice.type === 'error' ? '#842029' : '#0f5132',
+          }}
+        >
+          {notice.message}
+          <button
+            type="button"
+            onClick={() => setNotice(null)}
+            aria-label="Dismiss notification"
+            style={{ float: 'right', border: 0, background: 'transparent', cursor: 'pointer' }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <header style={{ textAlign: 'center', marginBottom: '40px', borderBottom: '2px solid #007bff', paddingBottom: '20px' }}>
         <h1 style={{ margin: '0 0 10px 0', color: '#333' }}>🔍 Deepfake Detection Suite</h1>
         <p style={{ margin: '0', color: '#666' }}>Language-Agnostic Analysis | WhatsApp Compression Ready</p>
       </header>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px', marginBottom: '40px' }}>
+      <div className="dashboard-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '30px', marginBottom: '40px' }}>
         <div style={{ padding: '20px', border: '2px dashed #007bff', borderRadius: '8px', textAlign: 'center' }}>
           <h3>📹 Upload Video</h3>
           <input
@@ -280,6 +323,11 @@ function App() {
       {result && (
         <div style={{ marginTop: '40px', padding: '30px', backgroundColor: '#f8f9fa', borderRadius: '8px' }}>
           <h2 style={{ marginTop: '0' }}>📊 Analysis Results</h2>
+          {result.disclaimer && (
+            <div role="note" style={{ padding: '12px', marginBottom: '20px', backgroundColor: '#fff3cd', color: '#664d03', borderRadius: '4px' }}>
+              ⚠️ {result.disclaimer}
+            </div>
+          )}
 
           <VerdictBadge
             verdict={result.verdict || result.final_result?.verdict}
@@ -290,17 +338,17 @@ function App() {
             <h4 style={{ marginBottom: '15px' }}>Component Analysis</h4>
             <ScoreMeter
               label="Vision AI"
-              score={(result.component_scores?.vision || result.final_result?.vision_score || 0.5) / 100}
+              score={result.component_scores?.vision ?? result.final_result?.vision_score ?? 0.5}
               icon="👁️"
             />
             <ScoreMeter
               label="Audio Analysis"
-              score={(result.component_scores?.audio || result.final_result?.audio_score || 0.5) / 100}
+              score={result.component_scores?.audio ?? result.final_result?.audio_score ?? 0.5}
               icon="🎤"
             />
             <ScoreMeter
               label="Lip-Sync Detection"
-              score={(result.component_scores?.sync || result.final_result?.sync_score || 0.5) / 100}
+              score={result.component_scores?.sync ?? result.final_result?.sync_score ?? 0.5}
               icon="👄"
             />
           </div>

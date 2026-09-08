@@ -4,16 +4,19 @@ High-volume video analysis with distributed workers
 """
 
 import logging
+from pathlib import Path
 from celery import Celery, Task
 from celery.result import AsyncResult
 from datetime import datetime
 from typing import Dict, List
 import json
 
-from config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, DATABASE_URL
-from models import Video, BatchJob, FinalResult, SessionLocal, AuditLog
+from config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, DATABASE_URL, RETENTION_DAYS
+from models import Video, BatchJob, BatchVideoMembership, FinalResult, AuditLog, init_db
 from pipeline import DeepfakeDetectionPipeline
 import uuid
+
+_, SessionLocal = init_db(DATABASE_URL)
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,32 @@ app.conf.update(
     task_track_started=True,
     task_time_limit=30 * 60,  # 30 minutes
     result_expires=3600,  # 1 hour
+    beat_schedule={"retention-cleanup": {
+        "task": "celery_tasks.cleanup_retention",
+        "schedule": 86400.0,
+    }},
 )
+
+
+@app.task
+def cleanup_retention():
+    """Delete expired uploads and their database rows."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
+    session = SessionLocal()
+    deleted = 0
+    try:
+        expired = session.query(Video).filter(Video.submitted_at < cutoff).all()
+        for video in expired:
+            path = Path(video.file_path) if video.file_path else None
+            if path and path.exists():
+                path.unlink()
+            session.delete(video)
+            deleted += 1
+        session.commit()
+        return {"deleted": deleted}
+    finally:
+        session.close()
 
 
 class CallbackTask(Task):
@@ -64,7 +92,7 @@ app.Task = CallbackTask
 
 
 @app.task(bind=True, max_retries=3)
-def analyze_video_task(self, video_id: str, file_path: str):
+def analyze_video_task(self, video_id: str, file_path: str, batch_id: str | None = None):
     """
     Celery task for analyzing a single video
     
@@ -101,6 +129,13 @@ def analyze_video_task(self, video_id: str, file_path: str):
         video.progress_percent = 100
         video.processing_completed_at = datetime.utcnow()
         session.commit()
+        if batch_id:
+            membership = session.query(BatchVideoMembership).filter_by(
+                batch_id=batch_id, video_id=video_id
+            ).first()
+            if membership:
+                membership.status = "completed"
+                session.commit()
         
         logger.info(f"[CELERY] Analysis complete for {video_id}")
         return {
@@ -111,6 +146,13 @@ def analyze_video_task(self, video_id: str, file_path: str):
     
     except Exception as exc:
         logger.error(f"[CELERY] Analysis failed for {video_id}: {exc}")
+        if batch_id and self.request.retries >= self.max_retries:
+            membership = session.query(BatchVideoMembership).filter_by(
+                batch_id=batch_id, video_id=video_id
+            ).first()
+            if membership:
+                membership.status = "failed"
+                session.commit()
         # Retry with exponential backoff
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
     
@@ -130,28 +172,33 @@ def batch_analyze_videos(batch_id: str, video_ids: List[str]):
     
     session = SessionLocal()
     try:
-        # Create batch job
-        batch_job = BatchJob(
-            id=batch_id,
-            job_name=f"batch_{batch_id[:8]}",
-            submission_source="api",
-            status="processing",
-            total_videos=len(video_ids),
-            started_at=datetime.utcnow()
-        )
-        session.add(batch_job)
-        session.commit()
+        batch_job = session.query(BatchJob).filter(BatchJob.id == batch_id).first()
+        if not batch_job:
+            batch_job = BatchJob(
+                id=batch_id, job_name=f"batch_{batch_id[:8]}", submission_source="api",
+                status="processing", total_videos=len(video_ids), started_at=datetime.utcnow()
+            )
+            session.add(batch_job)
+            session.flush()
+            for video_id in video_ids:
+                session.add(BatchVideoMembership(batch_id=batch_id, video_id=video_id))
+            session.commit()
         
         # Queue individual video tasks
         task_ids = []
         for video_id in video_ids:
             video = session.query(Video).filter(Video.id == video_id).first()
             if video:
+                membership = session.query(BatchVideoMembership).filter_by(
+                    batch_id=batch_id, video_id=video_id
+                ).one()
                 task = analyze_video_task.apply_async(
-                    args=(video_id, str(video.file_path)),
+                    args=(video_id, str(video.file_path), batch_id),
                     task_id=f"{batch_id}_{video_id}",
                     queue='default'
                 )
+                membership.status = "processing"
+                session.commit()
                 task_ids.append(task.id)
                 logger.info(f"[BATCH] Queued {video_id} (Task: {task.id})")
         
@@ -179,16 +226,13 @@ def check_batch_status(batch_id: str):
         if not batch:
             return {"error": "Batch not found"}
         
-        # Query all videos in batch
-        videos = session.query(Video).filter(
-            Video.id.like(f"{batch_id}%")
-        ).all()
+        memberships = session.query(BatchVideoMembership).filter_by(batch_id=batch_id).all()
         
-        completed = sum(1 for v in videos if v.status == "completed")
-        failed = sum(1 for v in videos if v.status == "failed")
-        processing = sum(1 for v in videos if v.status == "processing")
+        completed = sum(1 for m in memberships if m.status == "completed")
+        failed = sum(1 for m in memberships if m.status == "failed")
+        processing = sum(1 for m in memberships if m.status == "processing")
         
-        progress = int((completed + failed) / len(videos) * 100) if videos else 0
+        progress = int((completed + failed) / len(memberships) * 100) if memberships else 0
         
         # Update batch
         batch.progress_percent = progress
@@ -202,7 +246,7 @@ def check_batch_status(batch_id: str):
         
         return {
             "batch_id": batch_id,
-            "total": len(videos),
+            "total": len(memberships),
             "completed": completed,
             "failed": failed,
             "processing": processing,
@@ -224,12 +268,14 @@ def get_batch_results(batch_id: str) -> Dict:
     
     session = SessionLocal()
     try:
-        # Query all final results for batch videos
+        batch = session.query(BatchJob).filter(BatchJob.id == batch_id).first()
+        if not batch:
+            return {"error": "Batch not found"}
+
+        # Query final results for the videos explicitly assigned to this batch.
         results = session.query(FinalResult).join(
-            Video, FinalResult.video_id == Video.id
-        ).filter(
-            Video.id.like(f"{batch_id}%")
-        ).all()
+            BatchVideoMembership, BatchVideoMembership.video_id == FinalResult.video_id
+        ).filter(BatchVideoMembership.batch_id == batch_id).all()
         
         if not results:
             return {"error": "No results found"}

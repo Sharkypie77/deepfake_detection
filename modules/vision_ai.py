@@ -14,14 +14,16 @@ from scipy import signal
 from pathlib import Path
 import logging
 from typing import Dict, Tuple, List
-from mtcnn import MTCNN
+from facenet_pytorch import MTCNN
 import timm
+from config import VISION_CHECKPOINT_PATH
+from checkpoint_provenance import checkpoint_status
 
 logger = logging.getLogger(__name__)
 
 
 class FaceDetector:
-    """MTCNN-based face detection with landmark extraction"""
+    """PyTorch MTCNN face detection with landmark extraction."""
     
     def __init__(self, device: str = "cpu"):
         self.device = device
@@ -239,8 +241,29 @@ class VisionAIModule:
         self.freq_analyzer = FrequencyAnalyzer()
         self.spatial_analyzer = SpatialAnalyzer()
         
-        # Load pretrained EfficientNetV2-S for transfer learning
-        self.backbone = timm.create_model('efficientnet_v2_s', pretrained=True, num_classes=2)
+        self.backbone = timm.create_model('efficientnetv2_rw_s', pretrained=True, num_classes=2)
+        if VISION_CHECKPOINT_PATH:
+            checkpoint_path = Path(VISION_CHECKPOINT_PATH).expanduser()
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"Vision checkpoint not found: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            self.checkpoint_status = checkpoint_status("vision", str(checkpoint_path), checkpoint)
+            if not self.checkpoint_status["validated"]:
+                logger.warning("Vision checkpoint is unvalidated: %s", self.checkpoint_status["reason"])
+            state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+            state_dict = {key.removeprefix("backbone."): value for key, value in state_dict.items()}
+            missing, unexpected = self.backbone.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"Invalid vision checkpoint {checkpoint_path}; missing={missing}, unexpected={unexpected}"
+                )
+            logger.info("Fine-tuned vision checkpoint loaded from %s", checkpoint_path)
+        else:
+            self.checkpoint_status = {
+                "validated": False,
+                "reason": "imagenet-only, no fine-tuned checkpoint",
+            }
+            logger.warning("Vision AI is using ImageNet weights only; no deepfake-tuned checkpoint configured")
         self.backbone = self.backbone.to(device)
         self.backbone.eval()
         

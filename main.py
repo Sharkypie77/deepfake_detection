@@ -3,8 +3,8 @@ FastAPI Backend for Deepfake Detection Suite
 Handles video uploads, async processing, and results delivery
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query, Request
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import logging
@@ -13,13 +13,15 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import json
+import time
+from collections import defaultdict
 
 from config import (
     API_HOST, API_PORT, API_TITLE, API_VERSION, API_DESCRIPTION,
     VIDEO_UPLOAD_DIR, RESULTS_DIR, DATABASE_URL,
     ModelConfig, ProcessingConfig, SecurityConfig
 )
-from models import Video, VisionAnalysis, AudioAnalysis, SyncAnalysis, FinalResult, AuditLog, init_db
+from models import Video, VisionAnalysis, AudioAnalysis, SyncAnalysis, FinalResult, AuditLog, BatchJob, BatchVideoMembership, init_db
 from pipeline import DeepfakeDetectionPipeline
 from pydantic import BaseModel
 from typing import List
@@ -35,7 +37,7 @@ class BatchSubmitRequest(BaseModel):
     priority: str = "normal"  # low, normal, high
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "job_name": "election_batch_phase_1",
                 "video_ids": ["vid_001", "vid_002", "vid_003"],
@@ -44,8 +46,19 @@ class BatchSubmitRequest(BaseModel):
         }
 
 
-# Logging
-logging.basicConfig(level=logging.INFO)
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        })
+
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(JsonFormatter())
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -54,6 +67,14 @@ app = FastAPI(
     version=API_VERSION,
     description=API_DESCRIPTION
 )
+_rate_windows = defaultdict(list)
+_request_count = 0
+
+@app.middleware("http")
+async def request_metrics(request: Request, call_next):
+    global _request_count
+    _request_count += 1
+    return await call_next(request)
 
 # CORS
 if SecurityConfig.ENABLE_CORS:
@@ -74,8 +95,8 @@ try:
     detection_pipeline = DeepfakeDetectionPipeline(device=ProcessingConfig.DEVICE)
     logger.info("✅ Detection pipeline initialized")
 except Exception as e:
-    logger.error(f"Failed to initialize pipeline: {e}")
-    detection_pipeline = None
+    logger.critical("Failed to initialize detection pipeline: %s", e, exc_info=True)
+    raise
 
 
 # ============================================================================
@@ -90,6 +111,12 @@ async def health_check():
         "version": API_VERSION,
         "timestamp": datetime.utcnow().isoformat(),
         "pipeline_ready": detection_pipeline is not None
+        ,"models_validated": bool(getattr(detection_pipeline, "models_validated", False))
+        ,"mode": (
+            "production" if getattr(detection_pipeline, "models_validated", False)
+            else "unvalidated"
+        )
+        ,"checkpoints": getattr(detection_pipeline, "checkpoints", {})
     }
 
 
@@ -104,10 +131,14 @@ async def root():
             "health": "/health",
             "analyze": "/api/v1/analyze",
             "status": "/api/v1/status/{video_id}",
-            "results": "/api/v1/results/{video_id}",
-            "whatsapp_webhook": "/webhooks/whatsapp"
+            "results": "/api/v1/results/{video_id}"
         }
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics():
+    return f"# TYPE http_requests_total counter\nhttp_requests_total {_request_count}\n"
 
 
 # ============================================================================
@@ -116,6 +147,7 @@ async def root():
 
 @app.post("/api/v1/analyze")
 async def upload_and_analyze(
+    request: Request,
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
     async_mode: bool = True
@@ -132,6 +164,12 @@ async def upload_and_analyze(
     - analysis results (if async_mode=False)
     """
     
+    now = time.monotonic()
+    client = request.client.host if request.client else "unknown"
+    _rate_windows[client] = [t for t in _rate_windows[client] if now - t < 60]
+    if len(_rate_windows[client]) >= 10:
+        raise HTTPException(status_code=429, detail="Analysis rate limit exceeded")
+    _rate_windows[client].append(now)
     try:
         # Validate file
         if not file.filename:
@@ -231,7 +269,7 @@ async def get_status(video_id: str):
 
 
 @app.get("/api/v1/results/{video_id}")
-async def get_results(video_id: str):
+async def get_results(video_id: str, format: str = Query("json", pattern="^(json|pdf)$")):
     """Get analysis results for a video"""
     
     session = SessionLocal()
@@ -250,6 +288,26 @@ async def get_results(video_id: str):
         final_result = session.query(FinalResult).filter(FinalResult.video_id == video_id).first()
         if not final_result:
             raise HTTPException(status_code=500, detail="Results not found")
+
+        if format == "pdf":
+            from reportlab.lib.pagesizes import letter
+            from reportlab.pdfgen import canvas
+            pdf_path = RESULTS_DIR / f"{video_id}.pdf"
+            report = canvas.Canvas(str(pdf_path), pagesize=letter)
+            report.setFont("Helvetica", 11)
+            y = 750
+            for line in (
+                f"Deepfake Detection Report: {video_id}",
+                f"Verdict: {final_result.verdict}",
+                f"Risk: {final_result.risk_score}",
+                f"Findings: {final_result.key_findings or []}",
+                f"Timeline: generated {final_result.generated_at.isoformat()}",
+                f"Disclaimer: {final_result.disclaimer or 'None'}",
+            ):
+                report.drawString(50, y, line[:110])
+                y -= 24
+            report.save()
+            return FileResponse(pdf_path, media_type="application/pdf", filename=pdf_path.name)
         
         return {
             "video_id": video_id,
@@ -265,6 +323,7 @@ async def get_results(video_id: str):
                 "sync": final_result.sync_score
             },
             "generated_at": final_result.generated_at.isoformat()
+            ,"disclaimer": final_result.disclaimer
         }
     finally:
         session.close()
@@ -431,6 +490,7 @@ def save_results_to_db(session, video_id: str, result: dict):
         key_findings=final_result_data.get("key_findings", []),
         frame_anomaly_timeline=final_result_data.get("frame_anomaly_timeline", []),
         model_version=final_result_data.get("model_version")
+        ,disclaimer=result.get("disclaimer")
     )
     session.add(final_result)
     
@@ -467,8 +527,33 @@ async def submit_batch_job(
     """
     
     from celery_tasks import batch_analyze_videos
-    
-    batch_id = str(uuid.uuid4())
+
+    if not request.video_ids:
+        raise HTTPException(status_code=400, detail="At least one video_id is required")
+    if request.priority not in {"low", "normal", "high"}:
+        raise HTTPException(status_code=400, detail="priority must be low, normal, or high")
+
+    session = SessionLocal()
+    try:
+        found = session.query(Video.id).filter(Video.id.in_(request.video_ids)).all()
+        found_ids = {video_id for (video_id,) in found}
+        missing_ids = [video_id for video_id in request.video_ids if video_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(status_code=404, detail=f"Videos not found: {missing_ids}")
+        batch_id = str(uuid.uuid4())
+        batch = BatchJob(
+            id=batch_id, job_name=request.job_name, submission_source="api",
+            status="queued", total_videos=len(request.video_ids)
+        )
+        session.add(batch)
+        session.flush()
+        session.add_all([
+            BatchVideoMembership(batch_id=batch_id, video_id=video_id)
+            for video_id in request.video_ids
+        ])
+        session.commit()
+    finally:
+        session.close()
     
     # Queue batch job
     task = batch_analyze_videos.apply_async(
@@ -483,7 +568,7 @@ async def submit_batch_job(
         "batch_id": batch_id,
         "total_videos": len(request.video_ids),
         "status": "queued",
-        "task_ids": request.video_ids,
+        "task_ids": [task.id],
         "message": f"Batch submitted to queue. Check status with /api/v1/batch/{batch_id}/status"
     }
 
@@ -507,9 +592,33 @@ async def get_batch_status(batch_id: str):
     
     from celery_tasks import check_batch_status
     
-    result = check_batch_status.apply_async(args=(batch_id,)).get()
+    result = check_batch_status.run(batch_id)
     
     return result
+
+
+@app.get("/api/v1/videos/{video_id}/batches")
+async def get_video_batches(video_id: str):
+    session = SessionLocal()
+    try:
+        if not session.query(Video.id).filter(Video.id == video_id).first():
+            raise HTTPException(status_code=404, detail="Video not found")
+        memberships = session.query(BatchVideoMembership).filter_by(video_id=video_id).order_by(
+            BatchVideoMembership.added_at.desc()
+        ).all()
+        return {
+            "video_id": video_id,
+            "batches": [
+                {
+                    "batch_id": membership.batch_id,
+                    "added_at": membership.added_at.isoformat(),
+                    "status": membership.status,
+                }
+                for membership in memberships
+            ],
+        }
+    finally:
+        session.close()
 
 
 @app.get("/api/v1/batch/{batch_id}/results")
@@ -532,30 +641,94 @@ async def get_batch_results(batch_id: str):
     
     from celery_tasks import get_batch_results
     
-    result = get_batch_results.apply_async(args=(batch_id,)).get()
+    result = get_batch_results.run(batch_id)
     
     return result
 
 
 # ============================================================================
-# WHATSAPP WEBHOOK (Placeholder)
+# WHATSAPP WEBHOOK
 # ============================================================================
+
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+):
+    raise HTTPException(status_code=410, detail="WhatsApp integration is disabled; use Telegram or the REST API")
+
+
+async def _whatsapp_download_media(media_id: str, extension: str) -> tuple[bytes, str]:
+    if not WHATSAPP_API_TOKEN:
+        raise RuntimeError("WHATSAPP_API_TOKEN is not configured")
+    headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}"}
+    async with aiohttp.ClientSession(headers=headers) as client:
+        async with client.get(f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}") as response:
+            response.raise_for_status()
+            media = await response.json()
+        async with client.get(media["url"]) as response:
+            response.raise_for_status()
+            return await response.read(), extension
+
+
+async def _whatsapp_send_result(recipient: str, text: str):
+    if not WHATSAPP_PHONE_NUMBER_ID or not WHATSAPP_API_TOKEN:
+        raise RuntimeError("WhatsApp credentials are not configured")
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": recipient, "type": "text",
+               "text": {"body": text[:4096]}}
+    async with aiohttp.ClientSession(headers=headers) as client:
+        async with client.post(url, json=payload) as response:
+            response.raise_for_status()
+
+
+async def _process_whatsapp_video(video_id: str, file_path: str, recipient: str):
+    result = process_video_sync(video_id, file_path)
+    if result.get("status") == "completed":
+        text = f"Verdict: {result.get('verdict')}\nRisk: {result.get('risk_score')}\n{result.get('summary', '')}"
+    else:
+        text = f"Analysis status: {result.get('status', 'failed')}"
+    await _whatsapp_send_result(recipient, text)
+
 
 @app.post("/webhooks/whatsapp")
 async def whatsapp_webhook(
     background_tasks: BackgroundTasks,
     body: dict
 ):
+    raise HTTPException(status_code=410, detail="WhatsApp integration is disabled; use Telegram or the REST API")
     """
-    WhatsApp Cloud API webhook for receiving messages
-    Will be implemented in Phase 5
+    try:
+        value = body["entry"][0]["changes"][0]["value"]
+        message = value["messages"][0]
+        if message.get("type") != "video":
+            return {"status": "ignored"}
+        sender = message["from"]
+        media = message["video"]
+        extension = Path(media.get("filename", "upload.mp4")).suffix.lower() or ".mp4"
+        content, extension = await _whatsapp_download_media(media["id"], extension)
+        if len(content) > SecurityConfig.MAX_UPLOAD_SIZE_BYTES:
+            raise HTTPException(status_code=413, detail="File too large")
+        video_id = str(uuid.uuid4())
+        file_path = VIDEO_UPLOAD_DIR / f"{video_id}{extension}"
+        file_path.write_bytes(content)
+        session = SessionLocal()
+        try:
+            session.add(Video(
+                id=video_id, filename=media.get("filename", f"{video_id}{extension}"),
+                file_path=str(file_path), file_size_mb=len(content) / 1024 / 1024,
+                status="pending", submission_platform="whatsapp", submitted_at=datetime.utcnow(),
+            ))
+            session.commit()
+        finally:
+            session.close()
+        background_tasks.add_task(_process_whatsapp_video, video_id, str(file_path), sender)
+        return {"status": "queued", "video_id": video_id}
+    except KeyError:
+        return {"status": "ignored"}
     """
-    logger.info(f"WhatsApp webhook received: {body}")
-    
-    return {
-        "status": "received",
-        "message": "WhatsApp bot integration coming in Phase 5"
-    }
 
 
 # ============================================================================
